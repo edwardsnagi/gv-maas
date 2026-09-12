@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Qwen3.8-27B-FP8 on SGLang (OpenAI-compatible /v1).
+# Usage: ./sglang-qwen3.8-27b-fp8 [-slot=N[,N...]]
+#   ./sglang-qwen3.8-27b-fp8 -slot=0       # GPU 0
+#   ./sglang-qwen3.8-27b-fp8 -slot=1       # GPU 1
+#   ./sglang-qwen3.8-27b-fp8 -slot=0,1     # GPU 0,1 (tp-size=2)
+
+DATA_ROOT="${DATA_ROOT:-/data/edwardluke}"
+VENV_DIR="${VENV_DIR:-${DATA_ROOT}/venvs/sglang}"
+SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-${DATA_ROOT}/cache/sglang}"
+PYTHON="${PYTHON:-${VENV_DIR}/bin/python}"
+
+MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.8-27B-FP8}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+LOG_FILE="${LOG_FILE:-${SGLANG_CACHE_DIR}/sglang-server.log}"
+PID_FILE="${PID_FILE:-${SGLANG_CACHE_DIR}/sglang-server.pid}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [-slot=N[,N...]]
+
+Select GPU slot(s) to run Qwen3.8-27B-FP8. Multiple slots enable tensor parallel automatically.
+
+Examples:
+  $(basename "$0") -slot=0        # use GPU 0
+  $(basename "$0") -slot=1          # use GPU 1
+  $(basename "$0") -slot=0,1        # use GPU 0 and 1 (tp-size=2)
+  CUDA_VISIBLE_DEVICES=2 $(basename "$0") -slot=0
+
+The server runs in the background; the script waits until /health is OK before returning.
+
+Env overrides: MODEL_PATH, PORT, TP_SIZE, MEM_FRACTION_STATIC, VENV_DIR, SGLANG_CACHE_DIR, LOG_FILE, STARTUP_TIMEOUT
+EOF
+}
+
+list_gpus() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi -L 2>/dev/null || true
+  else
+    echo "nvidia-smi not found"
+  fi
+}
+
+escape_regex() {
+  printf '%s' "$1" | sed 's/[][\\.*^$()+?{|]/\\&/g'
+}
+
+find_previous_pids() {
+  local model_re="${1}" port="${2}" pids=""
+  pids="$(pgrep -f "sglang\\.launch_server.*${model_re}" 2>/dev/null | tr '\n' ' ' || true)"
+  if [[ -z "${pids// /}" ]]; then
+    pids="$(pgrep -f "sglang\\.launch_server.*--port ${port}" 2>/dev/null | tr '\n' ' ' || true)"
+  fi
+  printf '%s' "${pids}" | xargs -r echo
+}
+
+kill_pid_tree() {
+  local pid="${1}" child
+  for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    kill_pid_tree "${child}"
+  done
+  kill -TERM "${pid}" 2>/dev/null || true
+}
+
+wait_for_port_free() {
+  local port="${1}" i=0
+  while [[ "${i}" -lt 30 ]]; do
+    if ! ss -ltn 2>/dev/null | grep -q ":${port} "; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+stop_previous_server() {
+  local model_re pids pid still_running
+  model_re="$(escape_regex "${MODEL_PATH}")"
+  pids="$(find_previous_pids "${model_re}" "${PORT}")"
+
+  if [[ -z "${pids// /}" ]]; then
+    return 0
+  fi
+
+  echo "Stopping previous server on port ${PORT} (PIDs: ${pids})..."
+  for pid in ${pids}; do
+    kill_pid_tree "${pid}"
+  done
+
+  for _ in $(seq 1 30); do
+    still_running="$(find_previous_pids "${model_re}" "${PORT}")"
+    [[ -z "${still_running// /}" ]] && break
+    sleep 1
+  done
+
+  still_running="$(find_previous_pids "${model_re}" "${PORT}")"
+  if [[ -n "${still_running// /}" ]]; then
+    echo "Force killing remaining processes: ${still_running}"
+    for pid in ${still_running}; do
+      kill -KILL "${pid}" 2>/dev/null || true
+      pkill -KILL -P "${pid}" 2>/dev/null || true
+    done
+    sleep 1
+  fi
+
+  if ! wait_for_port_free "${PORT}"; then
+    echo "WARNING: port ${PORT} still in use after stop attempt" >&2
+  fi
+}
+
+health_host() {
+  local host="${1}"
+  [[ "${host}" == "0.0.0.0" || "${host}" == "::" ]] && host="127.0.0.1"
+  printf '%s' "${host}"
+}
+
+health_url() {
+  printf 'http://%s:%s/health' "$(health_host "${HOST}")" "${PORT}"
+}
+
+server_alive() {
+  kill -0 "${1}" 2>/dev/null
+}
+
+wait_for_server_ready() {
+  local pid="${1}" url="${2}" timeout="${3}" elapsed=0
+
+  echo "Waiting for server to become ready (timeout ${timeout}s)..."
+  while [[ "${elapsed}" -lt "${timeout}" ]]; do
+    if ! server_alive "${pid}"; then
+      echo "ERROR: server process ${pid} exited during startup." >&2
+      echo "Last log lines:" >&2
+      tail -30 "${LOG_FILE}" >&2
+      exit 1
+    fi
+
+    if curl -sf "${url}" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    sleep 2
+    elapsed=$((elapsed + 2))
+    if (( elapsed % 30 == 0 )); then
+      echo "  still starting... (${elapsed}s, tail -f ${LOG_FILE})"
+    fi
+  done
+
+  echo "ERROR: server did not become ready within ${timeout}s." >&2
+  tail -30 "${LOG_FILE}" >&2
+  exit 1
+}
+
+validate_slots() {
+  local slots="${1}"
+  [[ "${slots}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+    echo "ERROR: invalid -slot value: ${slots} (use e.g. -slot=0 or -slot=0,1)" >&2
+    exit 1
+  }
+  printf '%s' "${slots}"
+}
+
+count_gpus() {
+  local gpus="${1}" n=1
+  [[ "${gpus}" == *","* ]] || { echo 1; return; }
+  n="${gpus//[^,]/}"
+  echo $(( ${#n} + 1 ))
+}
+
+parse_args() {
+  SLOT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -slot=*)
+        SLOT="${1#-slot=}"
+        shift
+        ;;
+      -slot)
+        [[ $# -ge 2 ]] || {
+          echo "ERROR: -slot requires a value (e.g. -slot=0 or -slot 0)" >&2
+          exit 1
+        }
+        SLOT="$2"
+        shift 2
+        ;;
+      *)
+        echo "ERROR: unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+pick_gpus() {
+  local slot="${1:-}"
+
+  if [[ -n "${slot}" ]]; then
+    validate_slots "${slot}"
+    return
+  fi
+
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    validate_slots "${CUDA_VISIBLE_DEVICES}"
+    return
+  fi
+
+  if [[ -t 0 ]]; then
+    echo "Available GPUs:"
+    list_gpus
+    read -rp "Select GPU slot(s) [-slot=0]: " selected
+    selected="${selected#-slot=}"
+    selected="${selected:-0}"
+    validate_slots "${selected// /}"
+    return
+  fi
+
+  echo "0"
+}
+
+parse_args "$@"
+SELECTED_GPUS="$(pick_gpus "${SLOT}")"
+CUDA_VISIBLE_DEVICES="${SELECTED_GPUS}"
+
+if [[ -z "${TP_SIZE+x}" ]]; then
+  TP_SIZE="$(count_gpus "${CUDA_VISIBLE_DEVICES}")"
+fi
+
+if [[ ! -x "${PYTHON}" ]]; then
+  echo "ERROR: ${PYTHON} not found. Run ./scripts/env_scripts/sglang-install first." >&2
+  exit 1
+fi
+
+echo "Using GPU(s): ${CUDA_VISIBLE_DEVICES}  tp-size=${TP_SIZE}  port=${PORT}"
+
+stop_previous_server
+
+# flashinfer JIT needs ninja from venv (not on system PATH)
+VENV_BIN="$(dirname "${PYTHON}")"
+export PATH="${VENV_BIN}:${PATH}"
+export SGLANG_CACHE_DIR
+mkdir -p "${SGLANG_CACHE_DIR}"
+: > "${LOG_FILE}"
+
+nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+  SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR}" \
+  PATH="${PATH}" \
+  "${PYTHON}" -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --tp-size "${TP_SIZE}" \
+  --host "${HOST}" \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+  --mamba-ssm-dtype bfloat16 \
+  --chunked-prefill-size 2048 \
+  --attention-backend triton \
+  >> "${LOG_FILE}" 2>&1 &
+
+SERVER_PID=$!
+disown "${SERVER_PID}" 2>/dev/null || true
+printf '%s\n' "${SERVER_PID}" > "${PID_FILE}"
+
+HEALTH_HOST="$(health_host "${HOST}")"
+wait_for_server_ready "${SERVER_PID}" "$(health_url)" "${STARTUP_TIMEOUT}"
+
+echo "Server is ready (running in background)."
+echo "  PID:    ${SERVER_PID}"
+echo "  Log:    ${LOG_FILE}"
+echo "  URL:    http://${HEALTH_HOST}:${PORT}"
+echo "  Check:  curl http://${HEALTH_HOST}:${PORT}/health"
+echo "  Follow: tail -f ${LOG_FILE}"

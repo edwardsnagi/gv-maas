@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One-click SGLang install into a dedicated venv.
+# Usage: ./scripts/env_scripts/sglang-install
+#
+# Env overrides:
+#   VENV_DIR=/path/to/venv   default: /data/edwardluke/venvs/sglang
+#   DATA_ROOT=/data/edwardluke
+#   PYTHON=python3.12        bootstrap interpreter for venv creation
+#   CUDA_MAJOR=12            apply CUDA 12 wheel overrides (default: auto-detect)
+#   FORCE=1                  recreate venv from scratch
+#   USE_CN_MIRROR=0          use official PyPI / PyTorch sources (default: 1)
+#   PYPI_INDEX=...           override PyPI mirror URL
+#   PYTORCH_INDEX=...        override PyTorch wheel mirror URL
+#   SGLANG_VERSION=0.5.19    pin stable release (avoid slow dev builds)
+
+DATA_ROOT="${DATA_ROOT:-/data/edwardluke}"
+VENV_DIR="${VENV_DIR:-${DATA_ROOT}/venvs/sglang}"
+UV_CACHE_DIR="${UV_CACHE_DIR:-${DATA_ROOT}/cache/uv}"
+TMPDIR="${TMPDIR:-${DATA_ROOT}/cache/tmp}"
+export UV_CACHE_DIR TMPDIR
+
+PYTHON_BOOTSTRAP="${PYTHON:-python3}"
+VENV_PYTHON="${VENV_DIR}/bin/python"
+VENV_UV="${VENV_DIR}/bin/uv"
+
+USE_CN_MIRROR="${USE_CN_MIRROR:-1}"
+if [[ "${USE_CN_MIRROR}" == "1" ]]; then
+  PYPI_INDEX="${PYPI_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+  PYTORCH_INDEX="${PYTORCH_INDEX:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/cu129}"
+else
+  PYPI_INDEX="${PYPI_INDEX:-https://pypi.org/simple}"
+  PYTORCH_INDEX="${PYTORCH_INDEX:-https://download.pytorch.org/whl/cu129}"
+fi
+SGLANG_WHL_INDEX="${SGLANG_WHL_INDEX:-https://docs.sglang.ai/whl/cu129/}"
+SGLANG_VERSION="${SGLANG_VERSION:-0.5.19}"
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+uv_pip() {
+  "${VENV_UV}" pip install --python "${VENV_PYTHON}" \
+    --default-index "${PYPI_INDEX}" "$@"
+}
+
+detect_cuda_major() {
+  if [[ -n "${CUDA_MAJOR:-}" ]]; then
+    echo "${CUDA_MAJOR}"
+    return
+  fi
+  if command -v nvcc >/dev/null 2>&1; then
+    nvcc --version | sed -n 's/.*release \([0-9]\+\).*/\1/p' | head -1
+    return
+  fi
+  # Match PyTorch wheels to driver max CUDA (nvidia-smi "CUDA Version").
+  # Driver 12.x cannot run cu130 PyTorch — need cu129 override.
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local driver_cuda
+    driver_cuda="$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9]\+\).*/\1/p' | head -1)"
+    if [[ -n "${driver_cuda}" && "${driver_cuda}" -lt 13 ]]; then
+      echo "12"
+      return
+    fi
+    if [[ -n "${driver_cuda}" ]]; then
+      echo "${driver_cuda}"
+      return
+    fi
+  fi
+  echo "13"
+}
+
+require_python() {
+  command -v "${PYTHON_BOOTSTRAP}" >/dev/null 2>&1 || die "${PYTHON_BOOTSTRAP} not found"
+  "${PYTHON_BOOTSTRAP}" - <<'PY' || die "Python 3.10+ required"
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+venv_is_valid() {
+  [[ -x "${VENV_PYTHON}" ]]
+}
+
+create_venv() {
+  if [[ -d "${VENV_DIR}" ]]; then
+    if [[ "${FORCE:-}" == "1" ]]; then
+      log "Removing existing venv (FORCE=1): ${VENV_DIR}"
+      rm -rf "${VENV_DIR}"
+    elif ! venv_is_valid; then
+      log "Found incomplete venv (missing bin/python), recreating: ${VENV_DIR}"
+      rm -rf "${VENV_DIR}"
+    else
+      log "Reusing existing venv: ${VENV_DIR}"
+      return
+    fi
+  fi
+
+  log "Creating venv at ${VENV_DIR}"
+  if ! "${PYTHON_BOOTSTRAP}" -m venv "${VENV_DIR}"; then
+    die "venv creation failed. On Ubuntu try: sudo apt install python3-venv"
+  fi
+
+  if ! venv_is_valid; then
+    rm -rf "${VENV_DIR}"
+    die "venv is incomplete (no bin/python). Install venv support, e.g.: sudo apt install python3-venv"
+  fi
+}
+
+install_sglang() {
+  if [[ "${USE_CN_MIRROR}" == "1" ]]; then
+    log "Using China mirrors (PyPI: ${PYPI_INDEX})"
+  else
+    log "Using official PyPI (${PYPI_INDEX})"
+  fi
+
+  log "Upgrading pip and installing uv"
+  "${VENV_PYTHON}" -m pip install -i "${PYPI_INDEX}" --upgrade pip wheel
+  "${VENV_PYTHON}" -m pip install -i "${PYPI_INDEX}" uv
+
+  if [[ ! -x "${VENV_UV}" ]]; then
+    die "uv not found at ${VENV_UV} after pip install"
+  fi
+
+  # Install from PyPI mirror only — SGLANG_WHL_INDEX hosts GitHub nightly builds
+  # that timeout from China and override the pinned stable version.
+  log "Installing SGLang ${SGLANG_VERSION} from ${PYPI_INDEX}"
+  uv_pip --prerelease=allow "sglang[all]==${SGLANG_VERSION}"
+
+  local cuda_major
+  cuda_major="$(detect_cuda_major)"
+  if [[ "${cuda_major}" == "12" ]]; then
+    install_cu129_stack
+  else
+    log "CUDA ${cuda_major} — using default SGLang wheels"
+  fi
+}
+
+install_cu129_stack() {
+  # Driver max CUDA 12.x cannot run cu130 PyTorch. Must use cu129 wheels only —
+  # adding --extra-index-url (PyPI/mirror) pulls cu130 torch deps back in.
+  local pytorch_official="https://download.pytorch.org/whl/cu129"
+
+  log "Driver supports CUDA 12.x — replacing stack with cu129 wheels"
+  log "PyTorch index: ${pytorch_official} (official; mirror extra-index breaks cu129)"
+
+  "${VENV_UV}" pip install --python "${VENV_PYTHON}" \
+    --index-url "${pytorch_official}" \
+    --force-reinstall \
+    torch==2.13.0 torchaudio==2.11.0 torchvision
+
+  # Must be +cu129 build (PyPI/mirror extra-index installs cu130 kernel → libnvrtc.so.13 error on 4090)
+  "${VENV_UV}" pip install --python "${VENV_PYTHON}" \
+    --index-url "${SGLANG_WHL_INDEX}" \
+    --force-reinstall sglang-kernel
+
+  cleanup_cu130_extras
+  patch_flashinfer_nvcc_compat
+}
+
+cleanup_cu130_extras() {
+  log "Removing cu130-only extras and installing runtime helpers"
+  "${VENV_UV}" pip uninstall --python "${VENV_PYTHON}" -y \
+    sgl-deep-gemm sgl-deep-ep torchcodec 2>/dev/null || true
+  uv_pip pynvml ninja
+}
+
+patch_flashinfer_nvcc_compat() {
+  # flashinfer 0.6.x passes --compress-mode=size to nvcc; CUDA 12.4 toolkit rejects it.
+  local core_py nvcc_bin
+  core_py="$("${VENV_PYTHON}" -c 'import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), "jit", "core.py"))')"
+  [[ -f "${core_py}" ]] || return 0
+
+  nvcc_bin="$(command -v nvcc 2>/dev/null || true)"
+  if [[ -n "${nvcc_bin}" ]] && "${nvcc_bin}" --help 2>&1 | grep -q 'compress-mode'; then
+    log "System nvcc supports --compress-mode; flashinfer patch not needed"
+    return 0
+  fi
+
+  if grep -q 'compress-mode=size' "${core_py}"; then
+    log "Patching flashinfer for CUDA 12.4 nvcc (drop --compress-mode=size)"
+    "${VENV_PYTHON}" - <<PY
+from pathlib import Path
+path = Path("${core_py}")
+text = path.read_text()
+old = '''        "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
+        "--compress-mode=size",
+        "-DFLASHINFER_ENABLE_F16",'''
+new = '''        "-DFLASHINFER_ENABLE_F16",'''
+if old not in text:
+    raise SystemExit("flashinfer core.py layout changed; patch skipped")
+path.write_text(text.replace(old, new, 1))
+print("patched", path)
+PY
+  else
+    log "flashinfer nvcc patch already applied"
+  fi
+}
+
+verify_install() {
+  log "Verifying installation"
+  local version torch_cuda cuda_ok kernel_version
+  version="$("${VENV_PYTHON}" -c 'import sglang; print(sglang.__version__)')"
+  torch_cuda="$("${VENV_PYTHON}" -c 'import torch; print(torch.version.cuda or "none")' 2>/dev/null || echo unknown)"
+  cuda_ok="$("${VENV_PYTHON}" -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo False)"
+  kernel_version="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("sglang-kernel"))' 2>/dev/null || echo unknown)"
+  "${VENV_PYTHON}" -c 'from sgl_kernel import int8_scaled_mm' 2>/dev/null \
+    || die "sglang-kernel broken. Re-run: CUDA_MAJOR=12 ./scripts/env_scripts/sglang-install"
+  "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null
+
+  if [[ "${cuda_ok}" != "True" ]]; then
+    die "CUDA unavailable (torch+cu${torch_cuda}). Driver max CUDA < 13 needs cu129 wheels. Re-run: CUDA_MAJOR=12 ./scripts/env_scripts/sglang-install"
+  fi
+
+  printf '\n'
+  printf 'SGLang %s installed successfully (torch cu%s, kernel %s, CUDA OK).\n' \
+    "${version}" "${torch_cuda}" "${kernel_version}"
+  printf 'Python: %s\n' "${VENV_DIR}/bin/python"
+  printf '\n'
+  printf 'Next steps:\n'
+  printf '  ./scripts/model_scripts/sglang-qwen3.8-27b-fp8 -slot=0\n'
+  printf '  curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \\\n'
+  printf '    -d '"'"'{"model":"/data/models/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'"'"'\n'
+  printf '\n'
+  printf 'Or activate manually:\n'
+  printf '  source %s/bin/activate\n' "${VENV_DIR}"
+}
+
+main() {
+  log "SGLang installer"
+  mkdir -p "${DATA_ROOT}/cache/uv" "${DATA_ROOT}/cache/tmp" "${DATA_ROOT}/cache/sglang" "$(dirname "${VENV_DIR}")"
+  log "Venv: ${VENV_DIR}"
+  log "Cache: ${UV_CACHE_DIR}"
+  if [[ "${USE_CN_MIRROR}" == "1" ]]; then
+    log "Mirror mode: China (set USE_CN_MIRROR=0 for official sources)"
+  fi
+  require_python
+  create_venv
+  install_sglang
+  verify_install
+}
+
+main "$@"
