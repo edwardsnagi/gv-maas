@@ -13,7 +13,7 @@
 | 模型权重 | `/data/models/Qwen3.8-27B-FP8`（~28 GB FP8，单卡可跑） |
 | venv | `/data/edwardluke/venvs/sglang` |
 | 驱动 CUDA | 12.4 → 必须用 **cu129** 轮子 |
-| 默认端口 | `8000` |
+| 默认端口 | `10000`（LLM 1xxxx） |
 
 首次使用创建数据目录：
 
@@ -48,7 +48,7 @@ cd ~/singulardance/gv/gv-maas
 ### 非交互
 
 ```bash
-./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8 -slot=0 -port=8000 -tp=1 -dp=1 -y
+./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8 -slot=0 -port=10000 -tp=1 -dp=1 -y
 ```
 
 脚本会后台启动，**等待 `/health` 返回 200 后再回到终端**（首次约 1–3 分钟，含 CUDA graph capture）。
@@ -66,9 +66,9 @@ cd ~/singulardance/gv/gv-maas
 ## 3. 验证
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:10000/health
 
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:10000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"/data/models/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
 ```

@@ -185,30 +185,45 @@ ui_mem_bar() {
   printf '%s%s%s' "${color}" "${bar}" "${C0}"
 }
 
+# nvidia-smi nounits fields are MiB; format as one-decimal GB for display.
+ui_mib_gb() {
+  local mib="${1}" gb_x10=0
+  [[ "${mib}" =~ ^[0-9]+$ ]] || mib=0
+  gb_x10=$((mib * 10 / 1024))
+  printf '%d.%d' $((gb_x10 / 10)) $((gb_x10 % 10))
+}
+
 ui_gpu_cards() {
   if ! command -v nvidia-smi >/dev/null 2>&1; then
     printf '  %s(no GPU data — nvidia-smi missing)%s\n' "${CY}" "${C0}"
     return 1
   fi
 
-  while IFS=, read -r idx name total free util; do
+  while IFS=, read -r idx name total free used util; do
     name="${name# }"
     total="${total// /}"
     free="${free// /}"
+    used="${used// /}"
     util="${util// /}"
-    local used=$((total - free)) status="idle" sc="${CG}" dot="${G_DOT_OFF}"
+    [[ "${used}" =~ ^[0-9]+$ ]] || used=$((total - free))
+    local gpu_num=$((idx + 1)) status="idle" sc="${CG}" dot="${G_DOT_OFF}"
     if [[ "${util}" =~ ^[0-9]+$ && "${util}" -gt 5 ]]; then
       status="busy"; sc="${CY}"; dot="${G_DOT_ON}"
+    elif [[ "${used}" =~ ^[0-9]+$ && "${total}" =~ ^[0-9]+$ && "${total}" -gt 0 && $((used * 100 / total)) -gt 5 ]]; then
+      status="in use"; sc="${CY}"; dot="${G_DOT_ON}"
     fi
-    printf '  %s%s- Slot %-2s %s%s%s\n' "${CC}" "${G_LT}" "${idx}" "${CB}" "${name:0:32}" "${C0}"
+    printf '  %s%s- GPU %-2s %s%s%s  %s(cuda:%s)%s\n' \
+      "${CC}" "${G_LT}" "${gpu_num}" "${CB}" "${name:0:28}" "${C0}" "${CD}" "${idx}" "${C0}"
     printf '  %s%s%s  VRAM  ' "${CC}" "${G_V}" "${C0}"
     ui_mem_bar "${used}" "${total}"
-    printf '  %s%4s%s / %s GB   %s%s %s%s\n' "${CW}" "${free}" "${C0}" "${total}" "${sc}" "${dot}" "${status}" "${C0}"
+    printf '  %s%s%s / %s GB used  %s(%s GB free)%s   %s%s %s%s\n' \
+      "${CW}" "$(ui_mib_gb "${used}")" "${C0}" "$(ui_mib_gb "${total}")" \
+      "${CD}" "$(ui_mib_gb "${free}")" "${C0}" "${sc}" "${dot}" "${status}" "${C0}"
     printf '  %s%s%s  Util  %s%3s%%%s\n' "${CC}" "${G_V}" "${C0}" "${CW}" "${util}" "${C0}"
     printf '  %s%s%s\n' "${CC}" "${G_LB}" "$(ui_rule_char "${G_H}" $((ui_width - 8)))"
     echo
   done < <(
-    nvidia-smi --query-gpu=index,name,memory.total,memory.free,utilization.gpu \
+    nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu \
       --format=csv,noheader,nounits 2>/dev/null
   )
 }
@@ -498,7 +513,7 @@ wizard_step_parallel() {
 
 # ── Step 3: Port ─────────────────────────────────────────────────────────────
 wizard_step_port() {
-  local choice port=8000
+  local choice port=10000
 
   WIZ_HINT="Step 3 ${G_SEP} HTTP port"
   ui_transition 3 "Choosing service port..."
@@ -510,9 +525,9 @@ wizard_step_port() {
   port_status_label() {
     port_in_use "${1}" && printf '%sin use%s' "${CY}" "${C0}" || printf '%sfree%s' "${CG}" "${C0}"
   }
-  opts+=("[1] ${G_STAR} Port 8000  ${G_DASH}  $(port_status_label 8000)")
-  opts+=("[2]   Port 8001  ${G_DASH}  $(port_status_label 8001)")
-  opts+=("[3]   Port 8002  ${G_DASH}  $(port_status_label 8002)")
+  opts+=("[1] ${G_STAR} Port 10000  ${G_DASH}  $(port_status_label 10000)")
+  opts+=("[2]   Port 10001  ${G_DASH}  $(port_status_label 10001)")
+  opts+=("[3]   Port 10002  ${G_DASH}  $(port_status_label 10002)")
   opts+=("[4]   Port 8080  ${G_DASH}  $(port_status_label 8080)")
   opts+=("[C]   Custom port")
 
@@ -520,12 +535,12 @@ wizard_step_port() {
   choice="${UI_CHOICE}"
 
   case "${choice}" in
-    1|"") port=8000 ;;
-    2) port=8001 ;;
-    3) port=8002 ;;
+    1|"") port=10000 ;;
+    2) port=10001 ;;
+    3) port=10002 ;;
     4) port=8080 ;;
     [Cc]|[Cc][Uu][Ss][Tt])
-      port="$(ui_prompt "Enter port" "8000")"
+      port="$(ui_prompt "Enter port" "10000")"
       ;;
     *)
       printf '  %s%s invalid choice%s\n' "${CR}" "${G_FAIL}" "${C0}" >&2

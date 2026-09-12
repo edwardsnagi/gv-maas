@@ -1,34 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3.8-27B-FP8 on SGLang (OpenAI-compatible /v1).
-# Full config: scripts/qwen3.8-27b-fp8/README.md
+# Qwen3-Reranker (4B / 8B) on SGLang (/v1/rerank, decoder-only yes/no scoring).
+# Full config: scripts/qwen3-reranker/README.md
 #
 # Usage:
-#   ./sglang-qwen3.8-27b-fp8                              # interactive wizard
-#   ./sglang-qwen3.8-27b-fp8 -slot=0 -port=10000 -tp=1 -dp=1 -y
+#   ./sglang-qwen3-reranker -size=4b -slot=3 -port=30002 -y
+#   ./sglang-qwen3-reranker -size=4b -slot=3 -port=30002 -mem=0.24 -y
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/interactive.sh
-source "${SCRIPT_DIR}/lib/interactive.sh"
-# shellcheck source=lib/smoke-tests.sh
-source "${SCRIPT_DIR}/lib/smoke-tests.sh"
+# shellcheck source=../qwen3.8-27b-fp8/lib/interactive.sh
+source "${SCRIPT_DIR}/../qwen3.8-27b-fp8/lib/interactive.sh"
+# shellcheck source=../qwen3.8-27b-fp8/lib/smoke-tests.sh
+source "${SCRIPT_DIR}/../qwen3.8-27b-fp8/lib/smoke-tests.sh"
 
 DATA_ROOT="${DATA_ROOT:-/data/edwardluke}"
 VENV_DIR="${VENV_DIR:-${DATA_ROOT}/venvs/sglang}"
 SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-${DATA_ROOT}/cache/sglang}"
 PYTHON="${PYTHON:-${VENV_DIR}/bin/python}"
 
-MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.8-27B-FP8}"
-MODEL_NAME="Qwen3.8-27B-FP8"
+RERANK_MODEL_SIZE="${RERANK_MODEL_SIZE:-4b}"
+MODEL_PATH=""
+MODEL_NAME=""
+CHAT_TEMPLATE=""
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-10000}"
-TP_SIZE="${TP_SIZE:-1}"
-DP_SIZE="${DP_SIZE:-1}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
-LOG_FILE="${LOG_FILE:-${SGLANG_CACHE_DIR}/sglang-server.log}"
-PID_FILE="${PID_FILE:-${SGLANG_CACHE_DIR}/sglang-server.pid}"
-STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
+PORT="${PORT:-30001}"
+MEM_FRACTION_STATIC=""
+MEM_FRACTION_EXPLICIT=0
+LOG_FILE="${LOG_FILE:-${SGLANG_CACHE_DIR}/sglang-reranker-server.log}"
+PID_FILE="${PID_FILE:-${SGLANG_CACHE_DIR}/sglang-reranker-server.pid}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
 
 SLOT=""
 SKIP_INTERACTIVE="${SKIP_INTERACTIVE:-0}"
@@ -38,22 +39,71 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  -slot=N[,N...]   GPU slot(s), comma-separated
-  -port=N          HTTP port (default: 10000, LLM 1xxxx)
-  -tp=N            Tensor parallel size (default: 1)
-  -dp=N            Data parallel size (default: 1)
-  -y, --yes        Skip interactive wizard, use CLI/env defaults
-  -h, --help       Show this help
+  -size=4b|8b     Model size (default: 4b)
+  -slot=N         GPU slot (default: 2 — often same GPU as 4B embedding)
+  -port=N         HTTP port (default: 30001, Reranker 3xxxx)
+  -mem=F          mem-fraction-static (default: 4b=0.24, 8b=0.48)
+  -y, --yes       Skip prompts (auto-replace existing instance)
+  -h, --help      Show this help
 
-Interactive mode (default on TTY): 3-step wizard — slots → tp/dp → port.
-See scripts/qwen3.8-27b-fp8/README.md for recommended configs.
+Do NOT use --is-embedding for Qwen3-Reranker (decoder-only yes/no logprob scoring).
+4B default mem-fraction-static is 0.24 for co-location with 4B embedding on one GPU.
+First startup may take 1–3 min (CUDA graph capture); tail the log if it looks idle.
 
-The server runs in the background; the script waits until /health is OK before returning.
+Shared SGLang venv: ./scripts/qwen3.8-27b-fp8/sglang-install
 
-Env overrides: MODEL_PATH, PORT, TP_SIZE, DP_SIZE, HOST, MEM_FRACTION_STATIC,
-  VENV_DIR, SGLANG_CACHE_DIR, LOG_FILE, STARTUP_TIMEOUT, SKIP_INTERACTIVE=1,
-  SKIP_SMOKE_TEST=1
+Env overrides: MODEL_PATH, PORT, RERANK_MODEL_SIZE, MEM_FRACTION_STATIC,
+  VENV_DIR, SGLANG_CACHE_DIR, LOG_FILE, STARTUP_TIMEOUT, SKIP_SMOKE_TEST=1
 EOF
+}
+
+resolve_reranker_paths() {
+  RERANK_MODEL_SIZE="$(printf '%s' "${RERANK_MODEL_SIZE}" | tr '[:upper:]' '[:lower:]')"
+  case "${RERANK_MODEL_SIZE}" in
+    4b)
+      MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3-Reranker-4B}"
+      MODEL_NAME="Qwen3-Reranker-4B"
+      ;;
+    8|8b)
+      RERANK_MODEL_SIZE="8b"
+      # Weights live under Qwen3-Reranker-8 on disk; optional symlink Qwen3-Reranker-8B works too.
+      if [[ -d /data/models/Qwen3-Reranker-8B ]]; then
+        MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3-Reranker-8B}"
+      else
+        MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3-Reranker-8}"
+      fi
+      MODEL_NAME="Qwen3-Reranker-8B"
+      ;;
+    *)
+      printf '  %s%s invalid size: %s (use 4b or 8b)%s\n' "${CR}" "${G_FAIL}" "${RERANK_MODEL_SIZE}" "${C0}" >&2
+      return 1
+      ;;
+  esac
+  # HF model chat_template.jinja uses role=query/document; SGLang /v1/rerank passes
+  # messages[0]/messages[1] as user content. Use our bundled SGLang-compatible template.
+  CHAT_TEMPLATE="${CHAT_TEMPLATE:-${SCRIPT_DIR}/lib/qwen3_reranker.jinja}"
+  [[ -f "${CHAT_TEMPLATE}" ]] || {
+    echo "ERROR: chat template not found: ${CHAT_TEMPLATE}" >&2
+    return 1
+  }
+}
+
+default_mem_fraction_for_reranker() {
+  case "${RERANK_MODEL_SIZE}" in
+    4b) printf '0.24' ;;
+    8b) printf '0.48' ;;
+    *) printf '0.45' ;;
+  esac
+}
+
+resolve_mem_fraction() {
+  if [[ "${MEM_FRACTION_EXPLICIT}" == "1" && -n "${MEM_FRACTION_STATIC}" ]]; then
+    return 0
+  fi
+  if [[ -n "${MEM_FRACTION_STATIC}" ]]; then
+    return 0
+  fi
+  MEM_FRACTION_STATIC="$(default_mem_fraction_for_reranker)"
 }
 
 escape_regex() {
@@ -98,7 +148,7 @@ stop_previous_server() {
     return 0
   fi
 
-  echo "Stopping previous server on port ${PORT} (PIDs: ${pids})..."
+  echo "Stopping previous reranker server on port ${PORT} (PIDs: ${pids})..."
   for pid in ${pids}; do
     kill_pid_tree "${pid}"
   done
@@ -119,9 +169,8 @@ stop_previous_server() {
     sleep 1
   fi
 
-  if ! wait_for_port_free "${PORT}"; then
+  wait_for_port_free "${PORT}" || \
     echo "WARNING: port ${PORT} still in use after stop attempt" >&2
-  fi
 }
 
 health_host() {
@@ -145,7 +194,6 @@ wait_for_server_ready() {
   while [[ "${elapsed}" -lt "${timeout}" ]]; do
     if ! server_alive "${pid}"; then
       echo "ERROR: server process ${pid} exited during startup." >&2
-      echo "Last log lines:" >&2
       tail -30 "${LOG_FILE}" >&2
       exit 1
     fi
@@ -168,8 +216,8 @@ wait_for_server_ready() {
 
 validate_slots() {
   local slots="${1}"
-  [[ "${slots}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
-    echo "ERROR: invalid slot value: ${slots} (use e.g. 0 or 0,1)" >&2
+  [[ "${slots}" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: invalid slot: ${slots} (single GPU id, e.g. 2)" >&2
     exit 1
   }
   printf '%s' "${slots}"
@@ -186,15 +234,21 @@ parse_args() {
         SKIP_INTERACTIVE=1
         shift
         ;;
+      -size=*)
+        RERANK_MODEL_SIZE="${1#-size=}"
+        shift
+        ;;
+      -size)
+        [[ $# -ge 2 ]] || { echo "ERROR: -size requires 4b or 8b" >&2; exit 1; }
+        RERANK_MODEL_SIZE="$2"
+        shift 2
+        ;;
       -slot=*)
         SLOT="${1#-slot=}"
         shift
         ;;
       -slot)
-        [[ $# -ge 2 ]] || {
-          echo "ERROR: -slot requires a value" >&2
-          exit 1
-        }
+        [[ $# -ge 2 ]] || { echo "ERROR: -slot requires a value" >&2; exit 1; }
         SLOT="$2"
         shift 2
         ;;
@@ -207,22 +261,15 @@ parse_args() {
         PORT="$2"
         shift 2
         ;;
-      -tp=*)
-        TP_SIZE="${1#-tp=}"
+      -mem=*)
+        MEM_FRACTION_STATIC="${1#-mem=}"
+        MEM_FRACTION_EXPLICIT=1
         shift
         ;;
-      -tp)
-        [[ $# -ge 2 ]] || { echo "ERROR: -tp requires a value" >&2; exit 1; }
-        TP_SIZE="$2"
-        shift 2
-        ;;
-      -dp=*)
-        DP_SIZE="${1#-dp=}"
-        shift
-        ;;
-      -dp)
-        [[ $# -ge 2 ]] || { echo "ERROR: -dp requires a value" >&2; exit 1; }
-        DP_SIZE="$2"
+      -mem)
+        [[ $# -ge 2 ]] || { echo "ERROR: -mem requires a value" >&2; exit 1; }
+        MEM_FRACTION_STATIC="$2"
+        MEM_FRACTION_EXPLICIT=1
         shift 2
         ;;
       *)
@@ -234,53 +281,25 @@ parse_args() {
   done
 }
 
-config_complete() {
-  [[ -n "${SLOT}" && -n "${PORT}" && -n "${TP_SIZE}" && -n "${DP_SIZE}" ]]
-}
+parse_args "$@"
 
-resolve_config() {
-  parse_args "$@"
+RERANK_MODEL_SIZE="${RERANK_MODEL_SIZE:-4b}"
+SLOT="${SLOT:-2}"
+PORT="${PORT:-30001}"
 
-  if [[ "${SKIP_INTERACTIVE}" == "1" ]]; then
-    SLOT="${SLOT:-0}"
-    PORT="${PORT:-10000}"
-    TP_SIZE="${TP_SIZE:-1}"
-    DP_SIZE="${DP_SIZE:-1}"
-  elif [[ -t 0 ]] && ! config_complete; then
-    SLOT="${SLOT:-0}"
-    PORT="${PORT:-10000}"
-    TP_SIZE="${TP_SIZE:-1}"
-    DP_SIZE="${DP_SIZE:-1}"
-    run_launch_wizard "${MODEL_NAME}" "${MODEL_PATH}"
-    [[ "${WIZ_LAUNCH_ABORT:-0}" == "1" ]] && exit 0
-  else
-    SLOT="${SLOT:-${CUDA_VISIBLE_DEVICES:-0}}"
-    PORT="${PORT:-10000}"
-    TP_SIZE="${TP_SIZE:-1}"
-    DP_SIZE="${DP_SIZE:-1}"
-  fi
-
-  SLOT="$(validate_slots "${SLOT}")"
-  validate_port "${PORT}" || exit 1
-  validate_positive_int "tp-size" "${TP_SIZE}" || exit 1
-  validate_positive_int "dp-size" "${DP_SIZE}" || exit 1
-
-  local trimmed
-  trimmed="$(validate_parallel_plan "${SLOT}" "${TP_SIZE}" "${DP_SIZE}")" || exit 1
-  SLOT="${trimmed}"
-  CUDA_VISIBLE_DEVICES="${SLOT}"
-}
-
-resolve_config "$@"
+resolve_reranker_paths || exit 1
+SLOT="$(validate_slots "${SLOT}")"
+validate_port "${PORT}" || exit 1
+resolve_mem_fraction
 
 if [[ ! -x "${PYTHON}" ]]; then
   echo "ERROR: ${PYTHON} not found. Run ./scripts/qwen3.8-27b-fp8/sglang-install first." >&2
   exit 1
 fi
 
-echo "Using GPU(s): ${CUDA_VISIBLE_DEVICES}  tp-size=${TP_SIZE}  dp-size=${DP_SIZE}  port=${PORT}"
+echo "Using model: ${MODEL_NAME}  slot=${SLOT}  port=${PORT}  mem-fraction-static=${MEM_FRACTION_STATIC}"
 
-if [[ "${SKIP_INTERACTIVE}" == "1" || "${WIZ_REPLACE:-0}" == "1" ]]; then
+if [[ "${SKIP_INTERACTIVE}" == "1" ]]; then
   stop_previous_server
 fi
 
@@ -292,23 +311,16 @@ mkdir -p "${SGLANG_CACHE_DIR}"
 
 LAUNCH_ARGS=(
   --model-path "${MODEL_PATH}"
-  --tp-size "${TP_SIZE}"
   --host "${HOST}"
   --port "${PORT}"
   --trust-remote-code
-  --reasoning-parser qwen3
-  --tool-call-parser qwen3_coder
+  --chat-template "${CHAT_TEMPLATE}"
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
-  --mamba-ssm-dtype bfloat16
-  --chunked-prefill-size 2048
+  --disable-radix-cache
   --attention-backend triton
 )
 
-if [[ "${DP_SIZE}" -gt 1 ]]; then
-  LAUNCH_ARGS+=(--dp-size "${DP_SIZE}")
-fi
-
-nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
+nohup env CUDA_VISIBLE_DEVICES="${SLOT}" \
   SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR}" \
   PATH="${PATH}" \
   "${PYTHON}" -m sglang.launch_server \
@@ -323,14 +335,16 @@ HEALTH_HOST="$(health_host "${HOST}")"
 wait_for_server_ready "${SERVER_PID}" "$(health_url)" "${STARTUP_TIMEOUT}"
 
 if [[ "${SKIP_SMOKE_TEST:-0}" != "1" ]]; then
-  smoke_run "LLM /v1/chat/completions" "${SERVER_PID}" "${LOG_FILE}" \
-    smoke_test_llm "${HEALTH_HOST}" "${PORT}" "${MODEL_PATH}" "${PYTHON}" \
+  smoke_run "Reranker /v1/rerank (score discrimination)" "${SERVER_PID}" "${LOG_FILE}" \
+    smoke_test_reranker "${HEALTH_HOST}" "${PORT}" "${MODEL_PATH}" "${PYTHON}" \
     || exit 1
 fi
 
-echo "Server is ready (running in background)."
+echo "Reranker server is ready (running in background)."
 echo "  PID:    ${SERVER_PID}"
 echo "  Log:    ${LOG_FILE}"
 echo "  URL:    http://${HEALTH_HOST}:${PORT}"
 echo "  Check:  curl http://${HEALTH_HOST}:${PORT}/health"
+echo "  Test:   curl http://${HEALTH_HOST}:${PORT}/v1/rerank -H 'Content-Type: application/json' \\"
+echo "            -d '{\"model\":\"${MODEL_PATH}\",\"query\":\"What is Python?\",\"documents\":[\"Python is a programming language.\",\"The sky is blue.\"]}'"
 echo "  Follow: tail -f ${LOG_FILE}"

@@ -1,34 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3.8-27B-FP8 on SGLang (OpenAI-compatible /v1).
-# Full config: scripts/qwen3.8-27b-fp8/README.md
+# Qwen3-Embedding (4B / 8B) on SGLang (--is-embedding, OpenAI /v1/embeddings).
+# Full config: scripts/qwen3-embedding/README.md
 #
 # Usage:
-#   ./sglang-qwen3.8-27b-fp8                              # interactive wizard
-#   ./sglang-qwen3.8-27b-fp8 -slot=0 -port=10000 -tp=1 -dp=1 -y
+#   ./sglang-qwen3-embedding                              # interactive wizard
+#   ./sglang-qwen3-embedding -size=8b -slot=1 -port=20001 -y
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/interactive.sh
-source "${SCRIPT_DIR}/lib/interactive.sh"
-# shellcheck source=lib/smoke-tests.sh
-source "${SCRIPT_DIR}/lib/smoke-tests.sh"
+# shellcheck source=../qwen3.8-27b-fp8/lib/interactive.sh
+source "${SCRIPT_DIR}/../qwen3.8-27b-fp8/lib/interactive.sh"
+# shellcheck source=lib/embedding-wizard.sh
+source "${SCRIPT_DIR}/lib/embedding-wizard.sh"
+# shellcheck source=../qwen3.8-27b-fp8/lib/smoke-tests.sh
+source "${SCRIPT_DIR}/../qwen3.8-27b-fp8/lib/smoke-tests.sh"
 
 DATA_ROOT="${DATA_ROOT:-/data/edwardluke}"
 VENV_DIR="${VENV_DIR:-${DATA_ROOT}/venvs/sglang}"
 SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-${DATA_ROOT}/cache/sglang}"
 PYTHON="${PYTHON:-${VENV_DIR}/bin/python}"
 
-MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.8-27B-FP8}"
-MODEL_NAME="Qwen3.8-27B-FP8"
+EMBED_MODEL_SIZE="${EMBED_MODEL_SIZE:-8b}"
+MODEL_PATH=""
+MODEL_NAME=""
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-10000}"
-TP_SIZE="${TP_SIZE:-1}"
-DP_SIZE="${DP_SIZE:-1}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
-LOG_FILE="${LOG_FILE:-${SGLANG_CACHE_DIR}/sglang-server.log}"
-PID_FILE="${PID_FILE:-${SGLANG_CACHE_DIR}/sglang-server.pid}"
-STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
+PORT="${PORT:-20001}"
+MEM_FRACTION_STATIC=""
+MEM_FRACTION_EXPLICIT=0
+LOG_FILE="${LOG_FILE:-${SGLANG_CACHE_DIR}/sglang-embedding-server.log}"
+PID_FILE="${PID_FILE:-${SGLANG_CACHE_DIR}/sglang-embedding-server.pid}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
 
 SLOT=""
 SKIP_INTERACTIVE="${SKIP_INTERACTIVE:-0}"
@@ -38,22 +40,39 @@ usage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  -slot=N[,N...]   GPU slot(s), comma-separated
-  -port=N          HTTP port (default: 10000, LLM 1xxxx)
-  -tp=N            Tensor parallel size (default: 1)
-  -dp=N            Data parallel size (default: 1)
-  -y, --yes        Skip interactive wizard, use CLI/env defaults
-  -h, --help       Show this help
+  -size=4b|8b     Model size (default: 8b)
+  -slot=N         GPU slot (default: 1)
+  -port=N         HTTP port (default: 20001, Embedding 2xxxx)
+  -mem=F          mem-fraction-static (default: 4b=0.21, 8b=0.45)
+  -y, --yes       Skip interactive wizard
+  -h, --help      Show this help
 
-Interactive mode (default on TTY): 3-step wizard — slots → tp/dp → port.
-See scripts/qwen3.8-27b-fp8/README.md for recommended configs.
+Interactive mode (default on TTY): size → slot → port.
+Shared SGLang venv: ./scripts/qwen3.8-27b-fp8/sglang-install
 
-The server runs in the background; the script waits until /health is OK before returning.
-
-Env overrides: MODEL_PATH, PORT, TP_SIZE, DP_SIZE, HOST, MEM_FRACTION_STATIC,
+4B default mem-fraction-static is low (0.21) so a reranker can share the same GPU.
+Env overrides: MODEL_PATH, PORT, EMBED_MODEL_SIZE, MEM_FRACTION_STATIC,
   VENV_DIR, SGLANG_CACHE_DIR, LOG_FILE, STARTUP_TIMEOUT, SKIP_INTERACTIVE=1,
   SKIP_SMOKE_TEST=1
 EOF
+}
+
+default_mem_fraction_for_embedding() {
+  case "${EMBED_MODEL_SIZE}" in
+    4b) printf '0.21' ;;
+    8b) printf '0.45' ;;
+    *) printf '0.45' ;;
+  esac
+}
+
+resolve_mem_fraction() {
+  if [[ "${MEM_FRACTION_EXPLICIT}" == "1" && -n "${MEM_FRACTION_STATIC}" ]]; then
+    return 0
+  fi
+  if [[ -n "${MEM_FRACTION_STATIC}" ]]; then
+    return 0
+  fi
+  MEM_FRACTION_STATIC="$(default_mem_fraction_for_embedding)"
 }
 
 escape_regex() {
@@ -98,7 +117,7 @@ stop_previous_server() {
     return 0
   fi
 
-  echo "Stopping previous server on port ${PORT} (PIDs: ${pids})..."
+  echo "Stopping previous embedding server on port ${PORT} (PIDs: ${pids})..."
   for pid in ${pids}; do
     kill_pid_tree "${pid}"
   done
@@ -119,9 +138,8 @@ stop_previous_server() {
     sleep 1
   fi
 
-  if ! wait_for_port_free "${PORT}"; then
+  wait_for_port_free "${PORT}" || \
     echo "WARNING: port ${PORT} still in use after stop attempt" >&2
-  fi
 }
 
 health_host() {
@@ -145,7 +163,6 @@ wait_for_server_ready() {
   while [[ "${elapsed}" -lt "${timeout}" ]]; do
     if ! server_alive "${pid}"; then
       echo "ERROR: server process ${pid} exited during startup." >&2
-      echo "Last log lines:" >&2
       tail -30 "${LOG_FILE}" >&2
       exit 1
     fi
@@ -168,8 +185,8 @@ wait_for_server_ready() {
 
 validate_slots() {
   local slots="${1}"
-  [[ "${slots}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
-    echo "ERROR: invalid slot value: ${slots} (use e.g. 0 or 0,1)" >&2
+  [[ "${slots}" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: invalid slot: ${slots} (single GPU id, e.g. 1)" >&2
     exit 1
   }
   printf '%s' "${slots}"
@@ -186,15 +203,21 @@ parse_args() {
         SKIP_INTERACTIVE=1
         shift
         ;;
+      -size=*)
+        EMBED_MODEL_SIZE="${1#-size=}"
+        shift
+        ;;
+      -size)
+        [[ $# -ge 2 ]] || { echo "ERROR: -size requires 4b or 8b" >&2; exit 1; }
+        EMBED_MODEL_SIZE="$2"
+        shift 2
+        ;;
       -slot=*)
         SLOT="${1#-slot=}"
         shift
         ;;
       -slot)
-        [[ $# -ge 2 ]] || {
-          echo "ERROR: -slot requires a value" >&2
-          exit 1
-        }
+        [[ $# -ge 2 ]] || { echo "ERROR: -slot requires a value" >&2; exit 1; }
         SLOT="$2"
         shift 2
         ;;
@@ -207,22 +230,15 @@ parse_args() {
         PORT="$2"
         shift 2
         ;;
-      -tp=*)
-        TP_SIZE="${1#-tp=}"
+      -mem=*)
+        MEM_FRACTION_STATIC="${1#-mem=}"
+        MEM_FRACTION_EXPLICIT=1
         shift
         ;;
-      -tp)
-        [[ $# -ge 2 ]] || { echo "ERROR: -tp requires a value" >&2; exit 1; }
-        TP_SIZE="$2"
-        shift 2
-        ;;
-      -dp=*)
-        DP_SIZE="${1#-dp=}"
-        shift
-        ;;
-      -dp)
-        [[ $# -ge 2 ]] || { echo "ERROR: -dp requires a value" >&2; exit 1; }
-        DP_SIZE="$2"
+      -mem)
+        [[ $# -ge 2 ]] || { echo "ERROR: -mem requires a value" >&2; exit 1; }
+        MEM_FRACTION_STATIC="$2"
+        MEM_FRACTION_EXPLICIT=1
         shift 2
         ;;
       *)
@@ -235,39 +251,31 @@ parse_args() {
 }
 
 config_complete() {
-  [[ -n "${SLOT}" && -n "${PORT}" && -n "${TP_SIZE}" && -n "${DP_SIZE}" ]]
+  [[ -n "${SLOT}" && -n "${PORT}" && -n "${EMBED_MODEL_SIZE}" ]]
 }
 
 resolve_config() {
   parse_args "$@"
 
   if [[ "${SKIP_INTERACTIVE}" == "1" ]]; then
-    SLOT="${SLOT:-0}"
-    PORT="${PORT:-10000}"
-    TP_SIZE="${TP_SIZE:-1}"
-    DP_SIZE="${DP_SIZE:-1}"
+    EMBED_MODEL_SIZE="${EMBED_MODEL_SIZE:-8b}"
+    SLOT="${SLOT:-1}"
+    PORT="${PORT:-20001}"
+    resolve_embedding_paths || exit 1
   elif [[ -t 0 ]] && ! config_complete; then
-    SLOT="${SLOT:-0}"
-    PORT="${PORT:-10000}"
-    TP_SIZE="${TP_SIZE:-1}"
-    DP_SIZE="${DP_SIZE:-1}"
-    run_launch_wizard "${MODEL_NAME}" "${MODEL_PATH}"
+    run_embedding_wizard
     [[ "${WIZ_LAUNCH_ABORT:-0}" == "1" ]] && exit 0
   else
-    SLOT="${SLOT:-${CUDA_VISIBLE_DEVICES:-0}}"
-    PORT="${PORT:-10000}"
-    TP_SIZE="${TP_SIZE:-1}"
-    DP_SIZE="${DP_SIZE:-1}"
+    EMBED_MODEL_SIZE="${EMBED_MODEL_SIZE:-8b}"
+    SLOT="${SLOT:-${CUDA_VISIBLE_DEVICES:-1}}"
+    PORT="${PORT:-20001}"
+    resolve_embedding_paths || exit 1
   fi
 
   SLOT="$(validate_slots "${SLOT}")"
   validate_port "${PORT}" || exit 1
-  validate_positive_int "tp-size" "${TP_SIZE}" || exit 1
-  validate_positive_int "dp-size" "${DP_SIZE}" || exit 1
-
-  local trimmed
-  trimmed="$(validate_parallel_plan "${SLOT}" "${TP_SIZE}" "${DP_SIZE}")" || exit 1
-  SLOT="${trimmed}"
+  resolve_embedding_paths || exit 1
+  resolve_mem_fraction
   CUDA_VISIBLE_DEVICES="${SLOT}"
 }
 
@@ -278,7 +286,7 @@ if [[ ! -x "${PYTHON}" ]]; then
   exit 1
 fi
 
-echo "Using GPU(s): ${CUDA_VISIBLE_DEVICES}  tp-size=${TP_SIZE}  dp-size=${DP_SIZE}  port=${PORT}"
+echo "Using model: ${MODEL_NAME}  slot=${CUDA_VISIBLE_DEVICES}  port=${PORT}  mem-fraction-static=${MEM_FRACTION_STATIC}"
 
 if [[ "${SKIP_INTERACTIVE}" == "1" || "${WIZ_REPLACE:-0}" == "1" ]]; then
   stop_previous_server
@@ -292,21 +300,13 @@ mkdir -p "${SGLANG_CACHE_DIR}"
 
 LAUNCH_ARGS=(
   --model-path "${MODEL_PATH}"
-  --tp-size "${TP_SIZE}"
+  --is-embedding
   --host "${HOST}"
   --port "${PORT}"
   --trust-remote-code
-  --reasoning-parser qwen3
-  --tool-call-parser qwen3_coder
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
-  --mamba-ssm-dtype bfloat16
-  --chunked-prefill-size 2048
   --attention-backend triton
 )
-
-if [[ "${DP_SIZE}" -gt 1 ]]; then
-  LAUNCH_ARGS+=(--dp-size "${DP_SIZE}")
-fi
 
 nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
   SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR}" \
@@ -323,14 +323,17 @@ HEALTH_HOST="$(health_host "${HOST}")"
 wait_for_server_ready "${SERVER_PID}" "$(health_url)" "${STARTUP_TIMEOUT}"
 
 if [[ "${SKIP_SMOKE_TEST:-0}" != "1" ]]; then
-  smoke_run "LLM /v1/chat/completions" "${SERVER_PID}" "${LOG_FILE}" \
-    smoke_test_llm "${HEALTH_HOST}" "${PORT}" "${MODEL_PATH}" "${PYTHON}" \
+  EMBED_EXPECTED_DIM="$(smoke_expected_embedding_dim "${EMBED_MODEL_SIZE}")"
+  smoke_run "Embedding /v1/embeddings (dim=${EMBED_EXPECTED_DIM})" "${SERVER_PID}" "${LOG_FILE}" \
+    smoke_test_embedding "${HEALTH_HOST}" "${PORT}" "${MODEL_PATH}" "${EMBED_EXPECTED_DIM}" "${PYTHON}" \
     || exit 1
 fi
 
-echo "Server is ready (running in background)."
+echo "Embedding server is ready (running in background)."
 echo "  PID:    ${SERVER_PID}"
 echo "  Log:    ${LOG_FILE}"
 echo "  URL:    http://${HEALTH_HOST}:${PORT}"
 echo "  Check:  curl http://${HEALTH_HOST}:${PORT}/health"
+echo "  Test:   curl http://${HEALTH_HOST}:${PORT}/v1/embeddings -H 'Content-Type: application/json' \\"
+echo "            -d '{\"model\":\"${MODEL_PATH}\",\"input\":\"你好\"}'"
 echo "  Follow: tail -f ${LOG_FILE}"

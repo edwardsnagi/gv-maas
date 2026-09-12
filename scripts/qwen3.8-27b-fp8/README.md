@@ -91,7 +91,7 @@ sudo chown -R $USER:$USER /data/edwardluke
 | 变量 / CLI | 默认值 | 说明 |
 |------------|--------|------|
 | `-slot=N[,N...]` | `0` | 物理 GPU 槽位，逗号分隔 |
-| `-port=N` | `8000` | HTTP 服务端口 |
+| `-port=N` | `10000` | HTTP 服务端口（LLM 1xxxx） |
 | `-tp=N` | `1` | Tensor Parallel（模型切分） |
 | `-dp=N` | `1` | Data Parallel（模型副本数） |
 | `HOST` | `0.0.0.0` | 监听地址 |
@@ -104,10 +104,10 @@ sudo chown -R $USER:$USER /data/edwardluke
 
 | 方案 | slot | tp | dp | port | 适用场景 |
 |------|------|----|----|------|----------|
-| ★ 单卡推理 | `0` | 1 | 1 | 8000 | 默认；27B-FP8 单卡 48 GB 足够 |
-| 双卡 TP | `0,1` | 2 | 1 | 8000 | 更大 KV cache / 降低单卡压力 |
-| 双副本 DP | `0,1` | 1 | 2 | 8000 | 两路并发副本（高级） |
-| 四卡 TP | `0,1,2,3` | 4 | 1 | 8000 | 极限切分（通常不必） |
+| ★ 单卡推理 | `0` | 1 | 1 | 10000 | 默认；27B-FP8 单卡 48 GB 足够 |
+| 双卡 TP | `0,1` | 2 | 1 | 10000 | 更大 KV cache / 降低单卡压力 |
+| 双副本 DP | `0,1` | 1 | 2 | 10000 | 两路并发副本（高级） |
+| 四卡 TP | `0,1,2,3` | 4 | 1 | 10000 | 极限切分（通常不必） |
 
 ### 启动行为
 
@@ -124,7 +124,7 @@ sudo chown -R $USER:$USER /data/edwardluke
 ./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8
 
 # 非交互
-./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8 -slot=0 -port=8000 -tp=1 -dp=1 -y
+./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8 -slot=0 -port=10000 -tp=1 -dp=1 -y
 ```
 
 关闭动画：`UI_ANIM=0 ./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8`
@@ -134,9 +134,9 @@ Unicode 边框（终端支持 UTF-8 时）：`UI_UTF8=1 ./scripts/qwen3.8-27b-fp
 ### 冒烟测试
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:10000/health
 
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:10000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"/data/models/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
 ```
@@ -147,9 +147,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 | 组件 | 模型路径（规划） | 建议 slot | 建议 port |
 |------|------------------|-----------|-----------|
-| LLM | `/data/models/Qwen3.8-27B-FP8` | 0 | 8000 |
-| Embedding | `/data/models/Qwen3-Embedding-*` | 1 | 8001 |
-| Reranker | `/data/models/Qwen3-Reranker-*` | 2 | 8002 |
+| LLM | `/data/models/Qwen3.8-27B-FP8` | 0 | 10000 |
+| Embedding 8B | `/data/models/Qwen3-Embedding-8B` | 1 | 20001 |
+| Reranker 8B | `/data/models/Qwen3-Reranker-8` | 2 | 30001 |
+| Embedding 4B + Reranker 4B | 同卡 cuda:3 | 20002 / 30002 | 见 `strategy/4x4090-48g-rag-suite/` |
+
+Embedding：`./scripts/qwen3-embedding/sglang-qwen3-embedding`  
+Reranker：`./scripts/qwen3-reranker/sglang-qwen3-reranker`  
+同卡共部署时 Embedding 4B 用 `0.21`、Reranker 4B 用 `0.24`。
 
 ---
 

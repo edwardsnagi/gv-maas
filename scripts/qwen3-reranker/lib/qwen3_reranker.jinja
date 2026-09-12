@@ -1,0 +1,13 @@
+{# SGLang-compatible Qwen3-Reranker template (matches serving_rerank._render_jinja_chat_template). #}
+{# Do NOT use the HuggingFace model's chat_template.jinja — it expects role=query/document. #}
+<|im_start|>system
+Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
+<|im_start|>user
+<Instruct>: {{ instruct | default("Given a web search query, retrieve relevant passages that answer the query") }}
+<Query>: {{ messages[0]["content"] }}
+<Document>: {{ messages[1]["content"] }}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

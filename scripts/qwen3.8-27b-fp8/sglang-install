@@ -220,7 +220,7 @@ verify_install() {
   printf '\n'
   printf 'Next steps:\n'
   printf '  ./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8 -slot=0\n'
-  printf '  curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \\\n'
+  printf '  curl http://127.0.0.1:10000/v1/chat/completions -H "Content-Type: application/json" \\\n'
   printf '    -d '"'"'{"model":"/data/models/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'"'"'\n'
   printf '\n'
   printf 'Or activate manually:\n'
