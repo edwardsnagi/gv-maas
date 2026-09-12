@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # One-click SGLang install into a dedicated venv.
-# Usage: ./scripts/env_scripts/sglang-install
+# Full config: scripts/qwen3.8-27b-fp8/README.md
+# Usage: ./scripts/qwen3.8-27b-fp8/sglang-install
 #
 # Env overrides:
 #   VENV_DIR=/path/to/venv   default: /data/edwardluke/venvs/sglang
@@ -205,11 +206,11 @@ verify_install() {
   cuda_ok="$("${VENV_PYTHON}" -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo False)"
   kernel_version="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("sglang-kernel"))' 2>/dev/null || echo unknown)"
   "${VENV_PYTHON}" -c 'from sgl_kernel import int8_scaled_mm' 2>/dev/null \
-    || die "sglang-kernel broken. Re-run: CUDA_MAJOR=12 ./scripts/env_scripts/sglang-install"
+    || die "sglang-kernel broken. Re-run: CUDA_MAJOR=12 ./scripts/qwen3.8-27b-fp8/sglang-install"
   "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null
 
   if [[ "${cuda_ok}" != "True" ]]; then
-    die "CUDA unavailable (torch+cu${torch_cuda}). Driver max CUDA < 13 needs cu129 wheels. Re-run: CUDA_MAJOR=12 ./scripts/env_scripts/sglang-install"
+    die "CUDA unavailable (torch+cu${torch_cuda}). Driver max CUDA < 13 needs cu129 wheels. Re-run: CUDA_MAJOR=12 ./scripts/qwen3.8-27b-fp8/sglang-install"
   fi
 
   printf '\n'
@@ -218,7 +219,7 @@ verify_install() {
   printf 'Python: %s\n' "${VENV_DIR}/bin/python"
   printf '\n'
   printf 'Next steps:\n'
-  printf '  ./scripts/model_scripts/sglang-qwen3.8-27b-fp8 -slot=0\n'
+  printf '  ./scripts/qwen3.8-27b-fp8/sglang-qwen3.8-27b-fp8 -slot=0\n'
   printf '  curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" \\\n'
   printf '    -d '"'"'{"model":"/data/models/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'"'"'\n'
   printf '\n'

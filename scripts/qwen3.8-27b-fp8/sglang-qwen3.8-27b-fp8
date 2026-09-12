@@ -2,10 +2,15 @@
 set -euo pipefail
 
 # Qwen3.8-27B-FP8 on SGLang (OpenAI-compatible /v1).
-# Usage: ./sglang-qwen3.8-27b-fp8 [-slot=N[,N...]]
-#   ./sglang-qwen3.8-27b-fp8 -slot=0       # GPU 0
-#   ./sglang-qwen3.8-27b-fp8 -slot=1       # GPU 1
-#   ./sglang-qwen3.8-27b-fp8 -slot=0,1     # GPU 0,1 (tp-size=2)
+# Full config: scripts/qwen3.8-27b-fp8/README.md
+#
+# Usage:
+#   ./sglang-qwen3.8-27b-fp8                              # interactive wizard
+#   ./sglang-qwen3.8-27b-fp8 -slot=0 -port=8000 -tp=1 -dp=1 -y
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/interactive.sh
+source "${SCRIPT_DIR}/lib/interactive.sh"
 
 DATA_ROOT="${DATA_ROOT:-/data/edwardluke}"
 VENV_DIR="${VENV_DIR:-${DATA_ROOT}/venvs/sglang}"
@@ -13,37 +18,39 @@ SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-${DATA_ROOT}/cache/sglang}"
 PYTHON="${PYTHON:-${VENV_DIR}/bin/python}"
 
 MODEL_PATH="${MODEL_PATH:-/data/models/Qwen3.8-27B-FP8}"
+MODEL_NAME="Qwen3.8-27B-FP8"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
+TP_SIZE="${TP_SIZE:-1}"
+DP_SIZE="${DP_SIZE:-1}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 LOG_FILE="${LOG_FILE:-${SGLANG_CACHE_DIR}/sglang-server.log}"
 PID_FILE="${PID_FILE:-${SGLANG_CACHE_DIR}/sglang-server.pid}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
 
+SLOT=""
+SKIP_INTERACTIVE="${SKIP_INTERACTIVE:-0}"
+
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [-slot=N[,N...]]
+Usage: $(basename "$0") [options]
 
-Select GPU slot(s) to run Qwen3.8-27B-FP8. Multiple slots enable tensor parallel automatically.
+Options:
+  -slot=N[,N...]   GPU slot(s), comma-separated
+  -port=N          HTTP port (default: 8000)
+  -tp=N            Tensor parallel size (default: 1)
+  -dp=N            Data parallel size (default: 1)
+  -y, --yes        Skip interactive wizard, use CLI/env defaults
+  -h, --help       Show this help
 
-Examples:
-  $(basename "$0") -slot=0        # use GPU 0
-  $(basename "$0") -slot=1          # use GPU 1
-  $(basename "$0") -slot=0,1        # use GPU 0 and 1 (tp-size=2)
-  CUDA_VISIBLE_DEVICES=2 $(basename "$0") -slot=0
+Interactive mode (default on TTY): 3-step wizard — slots → tp/dp → port.
+See scripts/qwen3.8-27b-fp8/README.md for recommended configs.
 
 The server runs in the background; the script waits until /health is OK before returning.
 
-Env overrides: MODEL_PATH, PORT, TP_SIZE, MEM_FRACTION_STATIC, VENV_DIR, SGLANG_CACHE_DIR, LOG_FILE, STARTUP_TIMEOUT
+Env overrides: MODEL_PATH, PORT, TP_SIZE, DP_SIZE, HOST, MEM_FRACTION_STATIC,
+  VENV_DIR, SGLANG_CACHE_DIR, LOG_FILE, STARTUP_TIMEOUT, SKIP_INTERACTIVE=1
 EOF
-}
-
-list_gpus() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi -L 2>/dev/null || true
-  else
-    echo "nvidia-smi not found"
-  fi
 }
 
 escape_regex() {
@@ -159,26 +166,22 @@ wait_for_server_ready() {
 validate_slots() {
   local slots="${1}"
   [[ "${slots}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
-    echo "ERROR: invalid -slot value: ${slots} (use e.g. -slot=0 or -slot=0,1)" >&2
+    echo "ERROR: invalid slot value: ${slots} (use e.g. 0 or 0,1)" >&2
     exit 1
   }
   printf '%s' "${slots}"
 }
 
-count_gpus() {
-  local gpus="${1}" n=1
-  [[ "${gpus}" == *","* ]] || { echo 1; return; }
-  n="${gpus//[^,]/}"
-  echo $(( ${#n} + 1 ))
-}
-
 parse_args() {
-  SLOT=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help)
         usage
         exit 0
+        ;;
+      -y|--yes)
+        SKIP_INTERACTIVE=1
+        shift
         ;;
       -slot=*)
         SLOT="${1#-slot=}"
@@ -186,10 +189,37 @@ parse_args() {
         ;;
       -slot)
         [[ $# -ge 2 ]] || {
-          echo "ERROR: -slot requires a value (e.g. -slot=0 or -slot 0)" >&2
+          echo "ERROR: -slot requires a value" >&2
           exit 1
         }
         SLOT="$2"
+        shift 2
+        ;;
+      -port=*)
+        PORT="${1#-port=}"
+        shift
+        ;;
+      -port)
+        [[ $# -ge 2 ]] || { echo "ERROR: -port requires a value" >&2; exit 1; }
+        PORT="$2"
+        shift 2
+        ;;
+      -tp=*)
+        TP_SIZE="${1#-tp=}"
+        shift
+        ;;
+      -tp)
+        [[ $# -ge 2 ]] || { echo "ERROR: -tp requires a value" >&2; exit 1; }
+        TP_SIZE="$2"
+        shift 2
+        ;;
+      -dp=*)
+        DP_SIZE="${1#-dp=}"
+        shift
+        ;;
+      -dp)
+        [[ $# -ge 2 ]] || { echo "ERROR: -dp requires a value" >&2; exit 1; }
+        DP_SIZE="$2"
         shift 2
         ;;
       *)
@@ -201,71 +231,85 @@ parse_args() {
   done
 }
 
-pick_gpus() {
-  local slot="${1:-}"
-
-  if [[ -n "${slot}" ]]; then
-    validate_slots "${slot}"
-    return
-  fi
-
-  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    validate_slots "${CUDA_VISIBLE_DEVICES}"
-    return
-  fi
-
-  if [[ -t 0 ]]; then
-    echo "Available GPUs:"
-    list_gpus
-    read -rp "Select GPU slot(s) [-slot=0]: " selected
-    selected="${selected#-slot=}"
-    selected="${selected:-0}"
-    validate_slots "${selected// /}"
-    return
-  fi
-
-  echo "0"
+config_complete() {
+  [[ -n "${SLOT}" && -n "${PORT}" && -n "${TP_SIZE}" && -n "${DP_SIZE}" ]]
 }
 
-parse_args "$@"
-SELECTED_GPUS="$(pick_gpus "${SLOT}")"
-CUDA_VISIBLE_DEVICES="${SELECTED_GPUS}"
+resolve_config() {
+  parse_args "$@"
 
-if [[ -z "${TP_SIZE+x}" ]]; then
-  TP_SIZE="$(count_gpus "${CUDA_VISIBLE_DEVICES}")"
-fi
+  if [[ "${SKIP_INTERACTIVE}" == "1" ]]; then
+    SLOT="${SLOT:-0}"
+    PORT="${PORT:-8000}"
+    TP_SIZE="${TP_SIZE:-1}"
+    DP_SIZE="${DP_SIZE:-1}"
+  elif [[ -t 0 ]] && ! config_complete; then
+    SLOT="${SLOT:-0}"
+    PORT="${PORT:-8000}"
+    TP_SIZE="${TP_SIZE:-1}"
+    DP_SIZE="${DP_SIZE:-1}"
+    run_launch_wizard "${MODEL_NAME}" "${MODEL_PATH}"
+    [[ "${WIZ_LAUNCH_ABORT:-0}" == "1" ]] && exit 0
+  else
+    SLOT="${SLOT:-${CUDA_VISIBLE_DEVICES:-0}}"
+    PORT="${PORT:-8000}"
+    TP_SIZE="${TP_SIZE:-1}"
+    DP_SIZE="${DP_SIZE:-1}"
+  fi
+
+  SLOT="$(validate_slots "${SLOT}")"
+  validate_port "${PORT}" || exit 1
+  validate_positive_int "tp-size" "${TP_SIZE}" || exit 1
+  validate_positive_int "dp-size" "${DP_SIZE}" || exit 1
+
+  local trimmed
+  trimmed="$(validate_parallel_plan "${SLOT}" "${TP_SIZE}" "${DP_SIZE}")" || exit 1
+  SLOT="${trimmed}"
+  CUDA_VISIBLE_DEVICES="${SLOT}"
+}
+
+resolve_config "$@"
 
 if [[ ! -x "${PYTHON}" ]]; then
-  echo "ERROR: ${PYTHON} not found. Run ./scripts/env_scripts/sglang-install first." >&2
+  echo "ERROR: ${PYTHON} not found. Run ./scripts/qwen3.8-27b-fp8/sglang-install first." >&2
   exit 1
 fi
 
-echo "Using GPU(s): ${CUDA_VISIBLE_DEVICES}  tp-size=${TP_SIZE}  port=${PORT}"
+echo "Using GPU(s): ${CUDA_VISIBLE_DEVICES}  tp-size=${TP_SIZE}  dp-size=${DP_SIZE}  port=${PORT}"
 
-stop_previous_server
+if [[ "${SKIP_INTERACTIVE}" == "1" || "${WIZ_REPLACE:-0}" == "1" ]]; then
+  stop_previous_server
+fi
 
-# flashinfer JIT needs ninja from venv (not on system PATH)
 VENV_BIN="$(dirname "${PYTHON}")"
 export PATH="${VENV_BIN}:${PATH}"
 export SGLANG_CACHE_DIR
 mkdir -p "${SGLANG_CACHE_DIR}"
 : > "${LOG_FILE}"
 
+LAUNCH_ARGS=(
+  --model-path "${MODEL_PATH}"
+  --tp-size "${TP_SIZE}"
+  --host "${HOST}"
+  --port "${PORT}"
+  --trust-remote-code
+  --reasoning-parser qwen3
+  --tool-call-parser qwen3_coder
+  --mem-fraction-static "${MEM_FRACTION_STATIC}"
+  --mamba-ssm-dtype bfloat16
+  --chunked-prefill-size 2048
+  --attention-backend triton
+)
+
+if [[ "${DP_SIZE}" -gt 1 ]]; then
+  LAUNCH_ARGS+=(--dp-size "${DP_SIZE}")
+fi
+
 nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
   SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR}" \
   PATH="${PATH}" \
   "${PYTHON}" -m sglang.launch_server \
-  --model-path "${MODEL_PATH}" \
-  --tp-size "${TP_SIZE}" \
-  --host "${HOST}" \
-  --port "${PORT}" \
-  --trust-remote-code \
-  --reasoning-parser qwen3 \
-  --tool-call-parser qwen3_coder \
-  --mem-fraction-static "${MEM_FRACTION_STATIC}" \
-  --mamba-ssm-dtype bfloat16 \
-  --chunked-prefill-size 2048 \
-  --attention-backend triton \
+  "${LAUNCH_ARGS[@]}" \
   >> "${LOG_FILE}" 2>&1 &
 
 SERVER_PID=$!
